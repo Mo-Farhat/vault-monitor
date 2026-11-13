@@ -1,0 +1,72 @@
+name: Vault health check
+
+# Checks Vault's two health pages every 10 minutes and posts to a Lark group if either
+# fails twice in a row, a minute apart. It runs on GitHub, not Vercel, so it still reports
+# when Vercel is down. The Lark address is the repository secret LARK_WEBHOOK_URL; it is
+# not in this file.
+#
+# To send a test message without a real outage: Actions tab, "Vault health check",
+# Run workflow, tick "Send a test message".
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a test message to Lark even though Vault is fine"
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check Vault and tell Lark if it is down
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+          TEST_ALERT: ${{ inputs.test_alert }}
+        run: |
+          set -u
+
+          status() {
+            curl -sS -o /dev/null -w "%{http_code}" --max-time 20 "$1" || true
+          }
+
+          problems=""
+          for attempt in 1 2; do
+            problems=""
+            full=$(status "https://vault.inubzee.com/api/health/full")
+            site=$(status "https://vault.inubzee.com/api/health")
+            [ "$full" = "200" ] || problems="$problems Answering check returned $full."
+            [ "$site" = "200" ] || problems="$problems Site and database check returned $site."
+            [ -z "$problems" ] && break
+            [ "$attempt" = "1" ] && sleep 60
+          done
+
+          if [ -z "$problems" ] && [ "${TEST_ALERT:-false}" != "true" ]; then
+            echo "Vault is up."
+            exit 0
+          fi
+
+          if [ -z "$problems" ]; then
+            text="Vault monitor test: this is a test message. Vault is up."
+          else
+            text="Vault alert: Vault may be down.$problems It failed twice a minute apart. Time: $(date -u '+%Y-%m-%d %H:%M UTC')."
+          fi
+
+          if [ -z "${LARK_WEBHOOK_URL:-}" ]; then
+            echo "LARK_WEBHOOK_URL is not set, so no message could be sent."
+            exit 1
+          fi
+
+          reply=$(jq -n --arg t "$text" '{msg_type:"text",content:{text:$t}}' \
+            | curl -sS --max-time 20 -X POST -H "Content-Type: application/json" -d @- "$LARK_WEBHOOK_URL")
+          echo "Lark replied: $reply"
+          echo "$reply" | grep -q '"code":0' || { echo "Lark did not accept the message."; exit 1; }
+
+          # A real problem leaves the run red, so GitHub also records it.
+          [ -z "$problems" ] || exit 1
